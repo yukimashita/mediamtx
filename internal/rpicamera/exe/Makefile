@@ -15,13 +15,13 @@ CXXFLAGS = \
 	-Wno-unused-parameter \
 	-Wno-unused-result \
 	-std=c++17 \
-	$$(pkg-config --cflags libcamera)
+	$$(PKG_CONFIG_PATH=libcamera_prefix/lib/pkgconfig pkg-config --cflags libcamera)
 
 LDFLAGS = \
 	-s \
 	-pthread \
-	$$(pkg-config --libs freetype2) \
-	$$(pkg-config --libs libcamera)
+	$$(pkg-config --static --libs freetype2) \
+	$$(PKG_CONFIG_PATH=libcamera_prefix/lib/pkgconfig pkg-config --static --libs libcamera)
 
 OBJS = \
 	base64.o \
@@ -34,18 +34,28 @@ OBJS = \
 	text.o \
 	window.o
 
+LIBCAMERA = libcamera_prefix/lib/libcamera.a
+
 all: exe
+
+$(LIBCAMERA):
+	cd libcamera \
+	&& meson setup \
+	-Dlc-compliance=disabled \
+	-Dipas=raspberrypi \
+	-Dpipelines=raspberrypi \
+	--prefix=$(PWD)/libcamera_prefix \
+	build \
+	&& ninja -C build install
 
 text_font.h: text_font.ttf
 	xxd --include $< > text_font.h
 
-%.o: %.c text_font.h
+%.o: %.c $(LIBCAMERA) text_font.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-%.o: %.cpp
+%.o: %.cpp $(LIBCAMERA)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 exe: $(OBJS)
 	$(CXX) $^ $(LDFLAGS) -o $@
-	patchelf --replace-needed $$(basename /usr/lib/*-linux-*/libcamera.so.0*) libcamera.so.x.x.x $@
-	patchelf --replace-needed $$(basename /usr/lib/*-linux-*/libcamera-base.so.0*) libcamera-base.so.x.x.x $@
