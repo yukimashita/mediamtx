@@ -180,6 +180,9 @@ type Path struct {
 	RunOnUnread                string         `json:"runOnUnread"`
 	RunOnRecordSegmentCreate   string         `json:"runOnRecordSegmentCreate"`
 	RunOnRecordSegmentComplete string         `json:"runOnRecordSegmentComplete"`
+
+	// HTTP Request Headers for Safie Authentication
+	HTTPRequestHeaders         map[string]string `json:"httpRequestHeaders"`
 }
 
 func (pconf *Path) setDefaults() {
@@ -223,6 +226,9 @@ func (pconf *Path) setDefaults() {
 	// Hooks
 	pconf.RunOnDemandStartTimeout = 10 * StringDuration(time.Second)
 	pconf.RunOnDemandCloseAfter = 10 * StringDuration(time.Second)
+
+	// HTTP Request Headers
+	pconf.HTTPRequestHeaders = make(map[string]string)
 }
 
 func newPath(defaults *Path, partial *OptionalPath) *Path {

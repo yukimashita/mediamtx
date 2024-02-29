@@ -23,6 +23,7 @@ type Source struct {
 	ResolvedSource string
 	ReadTimeout    conf.StringDuration
 	Parent         defs.StaticSourceParent
+	HTTPRequestHeaders *map[string]string
 }
 
 // Log implements logger.Writer.
@@ -51,6 +52,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 				TLSClientConfig: tls.ConfigForFingerprint(params.Conf.SourceFingerprint),
 			},
 		},
+		HTTPRequestHeaders: s.HTTPRequestHeaders,
 		OnDownloadPrimaryPlaylist: func(u string) {
 			s.Log(logger.Debug, "downloading primary playlist %v", u)
 		},

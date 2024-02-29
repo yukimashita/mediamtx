@@ -83,6 +83,7 @@ func (s *staticSourceHandler) initialize() {
 			ResolvedSource: s.resolvedSource,
 			ReadTimeout:    s.readTimeout,
 			Parent:         s,
+			HTTPRequestHeaders: &s.conf.HTTPRequestHeaders,
 		}
 
 	case strings.HasPrefix(s.resolvedSource, "udp://"):

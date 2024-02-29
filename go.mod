@@ -77,3 +77,5 @@ replace code.cloudfoundry.org/bytefmt => github.com/cloudfoundry/bytefmt v0.0.0-
 replace github.com/pion/ice/v2 => github.com/aler9/ice/v2 v2.0.0-20231112223552-32d34dfcf3a1
 
 replace github.com/pion/webrtc/v3 => github.com/aler9/webrtc/v3 v3.0.0-20231112223655-e402ed2689c6
+
+replace github.com/bluenviron/gohlslib => ../gohlslib
