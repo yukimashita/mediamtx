@@ -50,6 +50,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 			Timeout: time.Duration(s.ReadTimeout),
 			Transport: &http.Transport{
 				TLSClientConfig: tls.ConfigForFingerprint(params.Conf.SourceFingerprint),
+				Proxy: http.ProxyFromEnvironment,
 			},
 		},
 		HTTPRequestHeaders: s.HTTPRequestHeaders,
