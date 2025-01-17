@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package externalcmd
 
@@ -13,7 +12,7 @@ import (
 	"github.com/kballard/go-shellquote"
 )
 
-func (e *Cmd) runOSSpecific() error {
+func (e *Cmd) runOSSpecific(env []string) error {
 	cmdParts, err := shellquote.Split(e.cmdstr)
 	if err != nil {
 		return err
@@ -21,13 +20,12 @@ func (e *Cmd) runOSSpecific() error {
 
 	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
 
-	cmd.Env = append([]string(nil), os.Environ()...)
-	for key, val := range e.env {
-		cmd.Env = append(cmd.Env, key+"="+val)
-	}
-
+	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	// set process group in order to allow killing subprocesses
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	err = cmd.Start()
 	if err != nil {
@@ -51,7 +49,8 @@ func (e *Cmd) runOSSpecific() error {
 
 	select {
 	case <-e.terminate:
-		syscall.Kill(cmd.Process.Pid, syscall.SIGINT) //nolint:errcheck
+		// the minus is needed to kill all subprocesses
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGINT) //nolint:errcheck
 		<-cmdDone
 		return errTerminated
 

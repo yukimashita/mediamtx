@@ -17,21 +17,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
-	pwebrtc "github.com/pion/webrtc/v3"
+	pwebrtc "github.com/pion/webrtc/v4"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
+	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 const (
-	pauseAfterAuthError        = 2 * time.Second
 	webrtcTurnSecretExpiration = 24 * 3600 * time.Second
-	webrtcPayloadMaxSize       = 1188 // 1200 - 12 (RTP header)
 )
 
 // ErrSessionNotFound is returned when a session is not found.
@@ -66,14 +65,14 @@ func randInt63n(n int64) (int64, error) {
 		return r & (n - 1), nil
 	}
 
-	max := int64((1 << 63) - 1 - (1<<63)%uint64(n))
+	maxVal := int64((1 << 63) - 1 - (1<<63)%uint64(n))
 
 	v, err := randInt63()
 	if err != nil {
 		return 0, err
 	}
 
-	for v > max {
+	for v > maxVal {
 		v, err = randInt63()
 		if err != nil {
 			return 0, err
@@ -134,14 +133,12 @@ type webRTCNewSessionRes struct {
 }
 
 type webRTCNewSessionReq struct {
-	pathName   string
-	remoteAddr string
-	query      string
-	user       string
-	pass       string
-	offer      []byte
-	publish    bool
-	res        chan webRTCNewSessionRes
+	pathName    string
+	remoteAddr  string
+	offer       []byte
+	publish     bool
+	httpRequest *http.Request
+	res         chan webRTCNewSessionRes
 }
 
 type webRTCAddSessionCandidatesRes struct {
@@ -150,6 +147,7 @@ type webRTCAddSessionCandidatesRes struct {
 }
 
 type webRTCAddSessionCandidatesReq struct {
+	pathName   string
 	secret     uuid.UUID
 	candidates []*pwebrtc.ICECandidateInit
 	res        chan webRTCAddSessionCandidatesRes
@@ -160,8 +158,15 @@ type webRTCDeleteSessionRes struct {
 }
 
 type webRTCDeleteSessionReq struct {
-	secret uuid.UUID
-	res    chan webRTCDeleteSessionRes
+	pathName string
+	secret   uuid.UUID
+	res      chan webRTCDeleteSessionRes
+}
+
+type serverPathManager interface {
+	FindPathConf(req defs.PathFindPathConfReq) (*conf.Path, error)
+	AddPublisher(req defs.PathAddPublisherReq) (defs.Path, error)
+	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
 }
 
 type serverParent interface {
@@ -175,17 +180,18 @@ type Server struct {
 	ServerKey             string
 	ServerCert            string
 	AllowOrigin           string
-	TrustedProxies        conf.IPsOrCIDRs
-	ReadTimeout           conf.StringDuration
-	WriteQueueSize        int
+	TrustedProxies        conf.IPNetworks
+	ReadTimeout           conf.Duration
 	LocalUDPAddress       string
 	LocalTCPAddress       string
 	IPsFromInterfaces     bool
 	IPsFromInterfacesList []string
 	AdditionalHosts       []string
 	ICEServers            []conf.WebRTCICEServer
+	HandshakeTimeout      conf.Duration
+	TrackGatherTimeout    conf.Duration
 	ExternalCmdPool       *externalcmd.Pool
-	PathManager           defs.PathManager
+	PathManager           serverPathManager
 	Parent                serverParent
 
 	ctx              context.Context
@@ -193,7 +199,8 @@ type Server struct {
 	httpServer       *httpServer
 	udpMuxLn         net.PacketConn
 	tcpMuxLn         net.Listener
-	api              *pwebrtc.API
+	iceUDPMux        ice.UDPMux
+	iceTCPMux        ice.TCPMux
 	sessions         map[*session]struct{}
 	sessionsBySecret map[uuid.UUID]*session
 
@@ -244,13 +251,6 @@ func (s *Server) Initialize() error {
 		return err
 	}
 
-	apiConf := webrtc.APIConf{
-		LocalRandomUDP:        false,
-		IPsFromInterfaces:     s.IPsFromInterfaces,
-		IPsFromInterfacesList: s.IPsFromInterfacesList,
-		AdditionalHosts:       s.AdditionalHosts,
-	}
-
 	if s.LocalUDPAddress != "" {
 		s.udpMuxLn, err = net.ListenPacket(restrictnetwork.Restrict("udp", s.LocalUDPAddress))
 		if err != nil {
@@ -258,7 +258,7 @@ func (s *Server) Initialize() error {
 			ctxCancel()
 			return err
 		}
-		apiConf.ICEUDPMux = pwebrtc.NewICEUDPMux(webrtcNilLogger, s.udpMuxLn)
+		s.iceUDPMux = pwebrtc.NewICEUDPMux(webrtcNilLogger, s.udpMuxLn)
 	}
 
 	if s.LocalTCPAddress != "" {
@@ -269,16 +269,7 @@ func (s *Server) Initialize() error {
 			ctxCancel()
 			return err
 		}
-		apiConf.ICETCPMux = pwebrtc.NewICETCPMux(webrtcNilLogger, s.tcpMuxLn, 8)
-	}
-
-	s.api, err = webrtc.NewAPI(apiConf)
-	if err != nil {
-		s.udpMuxLn.Close()
-		s.tcpMuxLn.Close()
-		s.httpServer.close()
-		ctxCancel()
-		return err
+		s.iceTCPMux = pwebrtc.NewICETCPMux(webrtcNilLogger, s.tcpMuxLn, 8)
 	}
 
 	str := "listener opened on " + s.Address + " (HTTP)"
@@ -317,14 +308,17 @@ outer:
 		select {
 		case req := <-s.chNewSession:
 			sx := &session{
-				parentCtx:       s.ctx,
-				writeQueueSize:  s.WriteQueueSize,
-				api:             s.api,
-				req:             req,
-				wg:              &wg,
-				externalCmdPool: s.ExternalCmdPool,
-				pathManager:     s.PathManager,
-				parent:          s,
+				parentCtx:             s.ctx,
+				ipsFromInterfaces:     s.IPsFromInterfaces,
+				ipsFromInterfacesList: s.IPsFromInterfacesList,
+				additionalHosts:       s.AdditionalHosts,
+				iceUDPMux:             s.iceUDPMux,
+				iceTCPMux:             s.iceTCPMux,
+				req:                   req,
+				wg:                    &wg,
+				externalCmdPool:       s.ExternalCmdPool,
+				pathManager:           s.PathManager,
+				parent:                s,
 			}
 			sx.initialize()
 			s.sessions[sx] = struct{}{}
@@ -337,7 +331,7 @@ outer:
 
 		case req := <-s.chAddSessionCandidates:
 			sx, ok := s.sessionsBySecret[req.secret]
-			if !ok {
+			if !ok || sx.req.pathName != req.pathName {
 				req.res <- webRTCAddSessionCandidatesRes{err: ErrSessionNotFound}
 				continue
 			}
@@ -346,7 +340,7 @@ outer:
 
 		case req := <-s.chDeleteSession:
 			sx, ok := s.sessionsBySecret[req.secret]
-			if !ok {
+			if !ok || sx.req.pathName != req.pathName {
 				req.res <- webRTCDeleteSessionRes{err: ErrSessionNotFound}
 				continue
 			}
@@ -423,30 +417,32 @@ func (s *Server) findSessionByUUID(uuid uuid.UUID) *session {
 	return nil
 }
 
-func (s *Server) generateICEServers() ([]pwebrtc.ICEServer, error) {
-	ret := make([]pwebrtc.ICEServer, len(s.ICEServers))
+func (s *Server) generateICEServers(clientConfig bool) ([]pwebrtc.ICEServer, error) {
+	ret := make([]pwebrtc.ICEServer, 0, len(s.ICEServers))
 
-	for i, server := range s.ICEServers {
-		if server.Username == "AUTH_SECRET" {
-			expireDate := time.Now().Add(webrtcTurnSecretExpiration).Unix()
+	for _, server := range s.ICEServers {
+		if !server.ClientOnly || clientConfig {
+			if server.Username == "AUTH_SECRET" {
+				expireDate := time.Now().Add(webrtcTurnSecretExpiration).Unix()
 
-			user, err := randomTurnUser()
-			if err != nil {
-				return nil, err
+				user, err := randomTurnUser()
+				if err != nil {
+					return nil, err
+				}
+
+				server.Username = strconv.FormatInt(expireDate, 10) + ":" + user
+
+				h := hmac.New(sha1.New, []byte(server.Password))
+				h.Write([]byte(server.Username))
+
+				server.Password = base64.StdEncoding.EncodeToString(h.Sum(nil))
 			}
 
-			server.Username = strconv.FormatInt(expireDate, 10) + ":" + user
-
-			h := hmac.New(sha1.New, []byte(server.Password))
-			h.Write([]byte(server.Username))
-
-			server.Password = base64.StdEncoding.EncodeToString(h.Sum(nil))
-		}
-
-		ret[i] = pwebrtc.ICEServer{
-			URLs:       []string{server.URL},
-			Username:   server.Username,
-			Credential: server.Password,
+			ret = append(ret, pwebrtc.ICEServer{
+				URLs:       []string{server.URL},
+				Username:   server.Username,
+				Credential: server.Password,
+			})
 		}
 	}
 

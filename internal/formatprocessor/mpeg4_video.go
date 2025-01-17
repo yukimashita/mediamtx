@@ -14,11 +14,24 @@ import (
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
+// MPEG-4 video related parameters
+var (
+	MPEG4VideoDefaultConfig = []byte{
+		0x00, 0x00, 0x01, 0xb0, 0x01, 0x00, 0x00, 0x01,
+		0xb5, 0x89, 0x13, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x01, 0x20, 0x00, 0xc4, 0x8d, 0x88, 0x00,
+		0xf5, 0x3c, 0x04, 0x87, 0x14, 0x63, 0x00, 0x00,
+		0x01, 0xb2, 0x4c, 0x61, 0x76, 0x63, 0x35, 0x38,
+		0x2e, 0x31, 0x33, 0x34, 0x2e, 0x31, 0x30, 0x30,
+	}
+)
+
 type formatProcessorMPEG4Video struct {
 	udpMaxPayloadSize int
 	format            *format.MPEG4Video
 	encoder           *rtpmpeg4video.Encoder
 	decoder           *rtpmpeg4video.Decoder
+	randomStart       uint32
 }
 
 func newMPEG4Video(
@@ -33,6 +46,11 @@ func newMPEG4Video(
 
 	if generateRTPPackets {
 		err := t.createEncoder()
+		if err != nil {
+			return nil, err
+		}
+
+		t.randomStart, err = randUint32()
 		if err != nil {
 			return nil, err
 		}
@@ -93,9 +111,8 @@ func (t *formatProcessorMPEG4Video) ProcessUnit(uu unit.Unit) error { //nolint:d
 			return err
 		}
 
-		ts := uint32(multiplyAndDivide(u.PTS, time.Duration(t.format.ClockRate()), time.Second))
 		for _, pkt := range u.RTPPackets {
-			pkt.Timestamp += ts
+			pkt.Timestamp += t.randomStart + uint32(u.PTS)
 		}
 
 		u.RTPPackets = pkts
@@ -107,9 +124,9 @@ func (t *formatProcessorMPEG4Video) ProcessUnit(uu unit.Unit) error { //nolint:d
 func (t *formatProcessorMPEG4Video) ProcessRTPPacket( //nolint:dupl
 	pkt *rtp.Packet,
 	ntp time.Time,
-	pts time.Duration,
+	pts int64,
 	hasNonRTSPReaders bool,
-) (Unit, error) {
+) (unit.Unit, error) {
 	u := &unit.MPEG4Video{
 		Base: unit.Base{
 			RTPPackets: []*rtp.Packet{pkt},

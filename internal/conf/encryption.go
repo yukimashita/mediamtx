@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Encryption is the encryption parameter.
+// Encryption is the rtspEncryption / rtmpEncryption parameter.
 type Encryption int
 
 // values.
@@ -26,11 +26,8 @@ func (d Encryption) MarshalJSON() ([]byte, error) {
 	case EncryptionOptional:
 		out = "optional"
 
-	case EncryptionStrict:
-		out = "strict"
-
 	default:
-		return nil, fmt.Errorf("invalid encryption: %v", d)
+		out = "strict"
 	}
 
 	return json.Marshal(out)

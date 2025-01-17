@@ -12,15 +12,17 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/auth"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
-	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/bluenviron/gortsplib/v4/pkg/liberrors"
 	"github.com/google/uuid"
 
+	"github.com/bluenviron/mediamtx/internal/certloader"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 // ErrConnNotFound is returned when a connection is not found.
@@ -45,6 +47,12 @@ func printAddresses(srv *gortsplib.Server) string {
 	return strings.Join(ret, ", ")
 }
 
+type serverPathManager interface {
+	Describe(req defs.PathDescribeReq) defs.PathDescribeRes
+	AddPublisher(_ defs.PathAddPublisherReq) (defs.Path, error)
+	AddReader(_ defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
+}
+
 type serverParent interface {
 	logger.Writer
 }
@@ -52,9 +60,9 @@ type serverParent interface {
 // Server is a RTSP server.
 type Server struct {
 	Address             string
-	AuthMethods         []headers.AuthMethod
-	ReadTimeout         conf.StringDuration
-	WriteTimeout        conf.StringDuration
+	AuthMethods         []auth.ValidateMethod
+	ReadTimeout         conf.Duration
+	WriteTimeout        conf.Duration
 	WriteQueueSize      int
 	UseUDP              bool
 	UseMulticast        bool
@@ -67,12 +75,12 @@ type Server struct {
 	ServerCert          string
 	ServerKey           string
 	RTSPAddress         string
-	Protocols           map[conf.Protocol]struct{}
+	Transports          conf.RTSPTransports
 	RunOnConnect        string
 	RunOnConnectRestart bool
 	RunOnDisconnect     string
 	ExternalCmdPool     *externalcmd.Pool
-	PathManager         defs.PathManager
+	PathManager         serverPathManager
 	Parent              serverParent
 
 	ctx       context.Context
@@ -82,6 +90,7 @@ type Server struct {
 	mutex     sync.RWMutex
 	conns     map[*gortsplib.ServerConn]*conn
 	sessions  map[*gortsplib.ServerSession]*session
+	loader    *certloader.CertLoader
 }
 
 // Initialize initializes the server.
@@ -111,12 +120,13 @@ func (s *Server) Initialize() error {
 	}
 
 	if s.IsTLS {
-		cert, err := tls.LoadX509KeyPair(s.ServerCert, s.ServerKey)
+		var err error
+		s.loader, err = certloader.New(s.ServerCert, s.ServerKey, s.Parent)
 		if err != nil {
 			return err
 		}
 
-		s.srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		s.srv.TLSConfig = &tls.Config{GetCertificate: s.loader.GetCertificate()}
 	}
 
 	err := s.srv.Start()
@@ -148,6 +158,9 @@ func (s *Server) Close() {
 	s.Log(logger.Info, "listener is closing")
 	s.ctxCancel()
 	s.wg.Wait()
+	if s.loader != nil {
+		s.loader.Close()
+	}
 }
 
 func (s *Server) run() {
@@ -222,7 +235,7 @@ func (s *Server) OnResponse(sc *gortsplib.ServerConn, res *base.Response) {
 func (s *Server) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpenCtx) {
 	se := &session{
 		isTLS:           s.IsTLS,
-		protocols:       s.Protocols,
+		transports:      s.Transports,
 		rsession:        ctx.Session,
 		rconn:           ctx.Conn,
 		rserver:         s.srv,
@@ -322,6 +335,13 @@ func (s *Server) findSessionByUUID(uuid uuid.UUID) (*gortsplib.ServerSession, *s
 		}
 	}
 	return nil, nil
+}
+
+func (s *Server) findSessionByRSession(rsession *gortsplib.ServerSession) *session {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return s.sessions[rsession]
 }
 
 // APIConnsList is called by api and metrics.

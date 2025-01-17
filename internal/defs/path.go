@@ -2,11 +2,8 @@ package defs
 
 import (
 	"fmt"
-	"net"
 
-	"github.com/bluenviron/gortsplib/v4/pkg/base"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
@@ -28,28 +25,10 @@ type Path interface {
 	Name() string
 	SafeConf() *conf.Path
 	ExternalCmdEnv() externalcmd.Environment
-	StartPublisher(req PathStartPublisherReq) PathStartPublisherRes
+	StartPublisher(req PathStartPublisherReq) (*stream.Stream, error)
 	StopPublisher(req PathStopPublisherReq)
 	RemovePublisher(req PathRemovePublisherReq)
 	RemoveReader(req PathRemoveReaderReq)
-}
-
-// PathAccessRequest is an access request.
-type PathAccessRequest struct {
-	Name     string
-	Query    string
-	Publish  bool
-	SkipAuth bool
-
-	// only if skipAuth = false
-	IP          net.IP
-	User        string
-	Pass        string
-	Proto       AuthProtocol
-	ID          *uuid.UUID
-	RTSPRequest *base.Request
-	RTSPBaseURL *base.URL
-	RTSPNonce   string
 }
 
 // PathFindPathConfRes contains the response of FindPathConf().

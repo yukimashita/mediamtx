@@ -16,6 +16,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 // ErrConnNotFound is returned when a connection is not found.
@@ -23,11 +24,6 @@ var ErrConnNotFound = errors.New("connection not found")
 
 func srtMaxPayloadSize(u int) int {
 	return ((u - 16) / 188) * 188 // 16 = SRT header, 188 = MPEG-TS packet
-}
-
-type srtNewConnReq struct {
-	connReq srt.ConnRequest
-	res     chan *conn
 }
 
 type serverAPIConnsListRes struct {
@@ -58,6 +54,11 @@ type serverAPIConnsKickReq struct {
 	res  chan serverAPIConnsKickRes
 }
 
+type serverPathManager interface {
+	AddPublisher(req defs.PathAddPublisherReq) (defs.Path, error)
+	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
+}
+
 type serverParent interface {
 	logger.Writer
 }
@@ -66,15 +67,14 @@ type serverParent interface {
 type Server struct {
 	Address             string
 	RTSPAddress         string
-	ReadTimeout         conf.StringDuration
-	WriteTimeout        conf.StringDuration
-	WriteQueueSize      int
+	ReadTimeout         conf.Duration
+	WriteTimeout        conf.Duration
 	UDPMaxPayloadSize   int
 	RunOnConnect        string
 	RunOnConnectRestart bool
 	RunOnDisconnect     string
 	ExternalCmdPool     *externalcmd.Pool
-	PathManager         defs.PathManager
+	PathManager         serverPathManager
 	Parent              serverParent
 
 	ctx       context.Context
@@ -84,7 +84,7 @@ type Server struct {
 	conns     map[*conn]struct{}
 
 	// in
-	chNewConnRequest chan srtNewConnReq
+	chNewConnRequest chan srt.ConnRequest
 	chAcceptErr      chan error
 	chCloseConn      chan *conn
 	chAPIConnsList   chan serverAPIConnsListReq
@@ -107,7 +107,7 @@ func (s *Server) Initialize() error {
 	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
 
 	s.conns = make(map[*conn]struct{})
-	s.chNewConnRequest = make(chan srtNewConnReq)
+	s.chNewConnRequest = make(chan srt.ConnRequest)
 	s.chAcceptErr = make(chan error)
 	s.chCloseConn = make(chan *conn)
 	s.chAPIConnsList = make(chan serverAPIConnsListReq)
@@ -157,9 +157,8 @@ outer:
 				rtspAddress:         s.RTSPAddress,
 				readTimeout:         s.ReadTimeout,
 				writeTimeout:        s.WriteTimeout,
-				writeQueueSize:      s.WriteQueueSize,
 				udpMaxPayloadSize:   s.UDPMaxPayloadSize,
-				connReq:             req.connReq,
+				connReq:             req,
 				runOnConnect:        s.RunOnConnect,
 				runOnConnectRestart: s.RunOnConnectRestart,
 				runOnDisconnect:     s.RunOnDisconnect,
@@ -170,7 +169,6 @@ outer:
 			}
 			c.initialize()
 			s.conns[c] = struct{}{}
-			req.res <- c
 
 		case c := <-s.chCloseConn:
 			delete(s.conns, c)
@@ -230,20 +228,11 @@ func (s *Server) findConnByUUID(uuid uuid.UUID) *conn {
 }
 
 // newConnRequest is called by srtListener.
-func (s *Server) newConnRequest(connReq srt.ConnRequest) *conn {
-	req := srtNewConnReq{
-		connReq: connReq,
-		res:     make(chan *conn),
-	}
-
+func (s *Server) newConnRequest(connReq srt.ConnRequest) {
 	select {
-	case s.chNewConnRequest <- req:
-		c := <-req.res
-
-		return c.new(req)
-
+	case s.chNewConnRequest <- connReq:
 	case <-s.ctx.Done():
-		return nil
+		connReq.Reject(srt.REJ_CLOSE)
 	}
 }
 

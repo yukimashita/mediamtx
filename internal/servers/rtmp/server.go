@@ -12,11 +12,13 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bluenviron/mediamtx/internal/certloader"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
+	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 // ErrConnNotFound is returned when a connection is not found.
@@ -50,6 +52,11 @@ type serverAPIConnsKickReq struct {
 	res  chan serverAPIConnsKickRes
 }
 
+type serverPathManager interface {
+	AddPublisher(req defs.PathAddPublisherReq) (defs.Path, error)
+	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
+}
+
 type serverParent interface {
 	logger.Writer
 }
@@ -57,9 +64,8 @@ type serverParent interface {
 // Server is a RTMP server.
 type Server struct {
 	Address             string
-	ReadTimeout         conf.StringDuration
-	WriteTimeout        conf.StringDuration
-	WriteQueueSize      int
+	ReadTimeout         conf.Duration
+	WriteTimeout        conf.Duration
 	IsTLS               bool
 	ServerCert          string
 	ServerKey           string
@@ -68,7 +74,7 @@ type Server struct {
 	RunOnConnectRestart bool
 	RunOnDisconnect     string
 	ExternalCmdPool     *externalcmd.Pool
-	PathManager         defs.PathManager
+	PathManager         serverPathManager
 	Parent              serverParent
 
 	ctx       context.Context
@@ -76,6 +82,7 @@ type Server struct {
 	wg        sync.WaitGroup
 	ln        net.Listener
 	conns     map[*conn]struct{}
+	loader    *certloader.CertLoader
 
 	// in
 	chNewConn      chan net.Conn
@@ -93,13 +100,14 @@ func (s *Server) Initialize() error {
 			return net.Listen(restrictnetwork.Restrict("tcp", s.Address))
 		}
 
-		cert, err := tls.LoadX509KeyPair(s.ServerCert, s.ServerKey)
+		var err error
+		s.loader, err = certloader.New(s.ServerCert, s.ServerKey, s.Parent)
 		if err != nil {
 			return nil, err
 		}
 
 		network, address := restrictnetwork.Restrict("tcp", s.Address)
-		return tls.Listen(network, address, &tls.Config{Certificates: []tls.Certificate{cert}})
+		return tls.Listen(network, address, &tls.Config{GetCertificate: s.loader.GetCertificate()})
 	}()
 	if err != nil {
 		return err
@@ -147,6 +155,9 @@ func (s *Server) Close() {
 	s.Log(logger.Info, "listener is closing")
 	s.ctxCancel()
 	s.wg.Wait()
+	if s.loader != nil {
+		s.loader.Close()
+	}
 }
 
 func (s *Server) run() {
@@ -166,7 +177,6 @@ outer:
 				rtspAddress:         s.RTSPAddress,
 				readTimeout:         s.ReadTimeout,
 				writeTimeout:        s.WriteTimeout,
-				writeQueueSize:      s.WriteQueueSize,
 				runOnConnect:        s.RunOnConnect,
 				runOnConnectRestart: s.RunOnConnectRestart,
 				runOnDisconnect:     s.RunOnDisconnect,

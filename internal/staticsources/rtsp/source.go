@@ -62,9 +62,8 @@ func createRangeHeader(cnf *conf.Path) (*headers.Range, error) {
 
 // Source is a RTSP static source.
 type Source struct {
-	ResolvedSource string
-	ReadTimeout    conf.StringDuration
-	WriteTimeout   conf.StringDuration
+	ReadTimeout    conf.Duration
+	WriteTimeout   conf.Duration
 	WriteQueueSize int
 	Parent         defs.StaticSourceParent
 }
@@ -104,7 +103,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 		},
 	}
 
-	u, err := base.ParseURL(s.ResolvedSource)
+	u, err := base.ParseURL(params.ResolvedSource)
 	if err != nil {
 		return err
 	}
@@ -144,7 +143,7 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 					cforma := forma
 
 					c.OnPacketRTP(cmedi, cforma, func(pkt *rtp.Packet) {
-						pts, ok := c.PacketPTS(cmedi, pkt)
+						pts, ok := c.PacketPTS2(cmedi, pkt)
 						if !ok {
 							return
 						}

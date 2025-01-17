@@ -13,6 +13,17 @@ import (
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
+// H264-related parameters
+var (
+	H264DefaultSPS = []byte{ // 1920x1080 baseline
+		0x67, 0x42, 0xc0, 0x28, 0xd9, 0x00, 0x78, 0x02,
+		0x27, 0xe5, 0x84, 0x00, 0x00, 0x03, 0x00, 0x04,
+		0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20,
+	}
+
+	H264DefaultPPS = []byte{0x08, 0x06, 0x07, 0x08}
+)
+
 // extract SPS and PPS without decoding RTP packets
 func rtpH264ExtractParams(payload []byte) ([]byte, []byte) {
 	if len(payload) < 1 {
@@ -29,7 +40,7 @@ func rtpH264ExtractParams(payload []byte) ([]byte, []byte) {
 		return nil, payload
 
 	case h264.NALUTypeSTAPA:
-		payload := payload[1:]
+		payload = payload[1:]
 		var sps []byte
 		var pps []byte
 
@@ -73,9 +84,9 @@ func rtpH264ExtractParams(payload []byte) ([]byte, []byte) {
 type formatProcessorH264 struct {
 	udpMaxPayloadSize int
 	format            *format.H264
-
-	encoder *rtph264.Encoder
-	decoder *rtph264.Decoder
+	encoder           *rtph264.Encoder
+	decoder           *rtph264.Decoder
+	randomStart       uint32
 }
 
 func newH264(
@@ -90,6 +101,11 @@ func newH264(
 
 	if generateRTPPackets {
 		err := t.createEncoder(nil, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		t.randomStart, err = randUint32()
 		if err != nil {
 			return nil, err
 		}
@@ -226,9 +242,8 @@ func (t *formatProcessorH264) ProcessUnit(uu unit.Unit) error {
 		}
 		u.RTPPackets = pkts
 
-		ts := uint32(multiplyAndDivide(u.PTS, time.Duration(t.format.ClockRate()), time.Second))
 		for _, pkt := range u.RTPPackets {
-			pkt.Timestamp += ts
+			pkt.Timestamp += t.randomStart + uint32(u.PTS)
 		}
 	}
 
@@ -238,9 +253,9 @@ func (t *formatProcessorH264) ProcessUnit(uu unit.Unit) error {
 func (t *formatProcessorH264) ProcessRTPPacket( //nolint:dupl
 	pkt *rtp.Packet,
 	ntp time.Time,
-	pts time.Duration,
+	pts int64,
 	hasNonRTSPReaders bool,
-) (Unit, error) {
+) (unit.Unit, error) {
 	u := &unit.H264{
 		Base: unit.Base{
 			RTPPackets: []*rtp.Packet{pkt},

@@ -11,13 +11,9 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
-	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg1audio"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
 	"github.com/google/uuid"
 
-	"github.com/bluenviron/mediamtx/internal/asyncwriter"
+	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
@@ -25,11 +21,6 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/rtmp"
 	"github.com/bluenviron/mediamtx/internal/stream"
-	"github.com/bluenviron/mediamtx/internal/unit"
-)
-
-const (
-	pauseAfterAuthError = 2 * time.Second
 )
 
 func pathNameAndQuery(inURL *url.URL) (string, url.Values, string) {
@@ -51,16 +42,15 @@ type conn struct {
 	parentCtx           context.Context
 	isTLS               bool
 	rtspAddress         string
-	readTimeout         conf.StringDuration
-	writeTimeout        conf.StringDuration
-	writeQueueSize      int
+	readTimeout         conf.Duration
+	writeTimeout        conf.Duration
 	runOnConnect        string
 	runOnConnectRestart bool
 	runOnDisconnect     string
 	wg                  *sync.WaitGroup
 	nconn               net.Conn
 	externalCmdPool     *externalcmd.Pool
-	pathManager         defs.PathManager
+	pathManager         serverPathManager
 	parent              *Server
 
 	ctx       context.Context
@@ -165,7 +155,7 @@ func (c *conn) runReader() error {
 func (c *conn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	pathName, query, rawQuery := pathNameAndQuery(u)
 
-	res := c.pathManager.AddReader(defs.PathAddReaderReq{
+	path, stream, err := c.pathManager.AddReader(defs.PathAddReaderReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:  pathName,
@@ -173,22 +163,21 @@ func (c *conn) runRead(conn *rtmp.Conn, u *url.URL) error {
 			IP:    c.ip(),
 			User:  query.Get("user"),
 			Pass:  query.Get("pass"),
-			Proto: defs.AuthProtocolRTMP,
+			Proto: auth.ProtocolRTMP,
 			ID:    &c.uuid,
 		},
 	})
-
-	if res.Err != nil {
-		var terr defs.AuthenticationError
-		if errors.As(res.Err, &terr) {
+	if err != nil {
+		var terr *auth.Error
+		if errors.As(err, &terr) {
 			// wait some seconds to mitigate brute force attacks
-			<-time.After(pauseAfterAuthError)
+			<-time.After(auth.PauseAfterError)
 			return terr
 		}
-		return res.Err
+		return err
 	}
 
-	defer res.Path.RemoveReader(defs.PathRemoveReaderReq{Author: c})
+	defer path.RemoveReader(defs.PathRemoveReaderReq{Author: c})
 
 	c.mutex.Lock()
 	c.state = connStateRead
@@ -196,207 +185,43 @@ func (c *conn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	c.query = rawQuery
 	c.mutex.Unlock()
 
-	writer := asyncwriter.New(c.writeQueueSize, c)
-
-	defer res.Stream.RemoveReader(writer)
-
-	var w *rtmp.Writer
-
-	videoFormat := c.setupVideo(
-		&w,
-		res.Stream,
-		writer)
-
-	audioFormat := c.setupAudio(
-		&w,
-		res.Stream,
-		writer)
-
-	if videoFormat == nil && audioFormat == nil {
-		return fmt.Errorf(
-			"the stream doesn't contain any supported codec, which are currently H264, MPEG-4 Audio, MPEG-1/2 Audio")
+	err = rtmp.FromStream(stream, c, conn, c.nconn, time.Duration(c.writeTimeout))
+	if err != nil {
+		return err
 	}
 
 	c.Log(logger.Info, "is reading from path '%s', %s",
-		res.Path.Name(), defs.FormatsInfo(res.Stream.FormatsForReader(writer)))
+		path.Name(), defs.FormatsInfo(stream.ReaderFormats(c)))
 
 	onUnreadHook := hooks.OnRead(hooks.OnReadParams{
 		Logger:          c,
 		ExternalCmdPool: c.externalCmdPool,
-		Conf:            res.Path.SafeConf(),
-		ExternalCmdEnv:  res.Path.ExternalCmdEnv(),
+		Conf:            path.SafeConf(),
+		ExternalCmdEnv:  path.ExternalCmdEnv(),
 		Reader:          c.APISourceDescribe(),
 		Query:           rawQuery,
 	})
 	defer onUnreadHook()
 
-	var err error
-	w, err = rtmp.NewWriter(conn, videoFormat, audioFormat)
-	if err != nil {
-		return err
-	}
-
 	// disable read deadline
 	c.nconn.SetReadDeadline(time.Time{})
 
-	writer.Start()
+	stream.StartReader(c)
+	defer stream.RemoveReader(c)
 
 	select {
 	case <-c.ctx.Done():
-		writer.Stop()
 		return fmt.Errorf("terminated")
 
-	case err := <-writer.Error():
+	case err := <-stream.ReaderError(c):
 		return err
 	}
-}
-
-func (c *conn) setupVideo(
-	w **rtmp.Writer,
-	stream *stream.Stream,
-	writer *asyncwriter.Writer,
-) format.Format {
-	var videoFormatH264 *format.H264
-	videoMedia := stream.Desc().FindFormat(&videoFormatH264)
-
-	if videoFormatH264 != nil {
-		var videoDTSExtractor *h264.DTSExtractor
-
-		stream.AddReader(writer, videoMedia, videoFormatH264, func(u unit.Unit) error {
-			tunit := u.(*unit.H264)
-
-			if tunit.AU == nil {
-				return nil
-			}
-
-			idrPresent := false
-			nonIDRPresent := false
-
-			for _, nalu := range tunit.AU {
-				typ := h264.NALUType(nalu[0] & 0x1F)
-				switch typ {
-				case h264.NALUTypeIDR:
-					idrPresent = true
-
-				case h264.NALUTypeNonIDR:
-					nonIDRPresent = true
-				}
-			}
-
-			var dts time.Duration
-
-			// wait until we receive an IDR
-			if videoDTSExtractor == nil {
-				if !idrPresent {
-					return nil
-				}
-
-				videoDTSExtractor = h264.NewDTSExtractor()
-
-				var err error
-				dts, err = videoDTSExtractor.Extract(tunit.AU, tunit.PTS)
-				if err != nil {
-					return err
-				}
-			} else {
-				if !idrPresent && !nonIDRPresent {
-					return nil
-				}
-
-				var err error
-				dts, err = videoDTSExtractor.Extract(tunit.AU, tunit.PTS)
-				if err != nil {
-					return err
-				}
-			}
-
-			c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-			return (*w).WriteH264(tunit.PTS, dts, idrPresent, tunit.AU)
-		})
-
-		return videoFormatH264
-	}
-
-	return nil
-}
-
-func (c *conn) setupAudio(
-	w **rtmp.Writer,
-	stream *stream.Stream,
-	writer *asyncwriter.Writer,
-) format.Format {
-	var audioFormatMPEG4Audio *format.MPEG4Audio
-	audioMedia := stream.Desc().FindFormat(&audioFormatMPEG4Audio)
-
-	if audioMedia != nil {
-		stream.AddReader(writer, audioMedia, audioFormatMPEG4Audio, func(u unit.Unit) error {
-			tunit := u.(*unit.MPEG4Audio)
-
-			if tunit.AUs == nil {
-				return nil
-			}
-
-			for i, au := range tunit.AUs {
-				c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-				err := (*w).WriteMPEG4Audio(
-					tunit.PTS+time.Duration(i)*mpeg4audio.SamplesPerAccessUnit*
-						time.Second/time.Duration(audioFormatMPEG4Audio.ClockRate()),
-					au,
-				)
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
-		})
-
-		return audioFormatMPEG4Audio
-	}
-
-	var audioFormatMPEG1 *format.MPEG1Audio
-	audioMedia = stream.Desc().FindFormat(&audioFormatMPEG1)
-
-	if audioMedia != nil {
-		stream.AddReader(writer, audioMedia, audioFormatMPEG1, func(u unit.Unit) error {
-			tunit := u.(*unit.MPEG1Audio)
-
-			pts := tunit.PTS
-
-			for _, frame := range tunit.Frames {
-				var h mpeg1audio.FrameHeader
-				err := h.Unmarshal(frame)
-				if err != nil {
-					return err
-				}
-
-				if !(!h.MPEG2 && h.Layer == 3) {
-					return fmt.Errorf("RTMP only supports MPEG-1 layer 3 audio")
-				}
-
-				c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-				err = (*w).WriteMPEG1Audio(pts, &h, frame)
-				if err != nil {
-					return err
-				}
-
-				pts += time.Duration(h.SampleCount()) *
-					time.Second / time.Duration(h.SampleRate)
-			}
-
-			return nil
-		})
-
-		return audioFormatMPEG1
-	}
-
-	return nil
 }
 
 func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 	pathName, query, rawQuery := pathNameAndQuery(u)
 
-	res := c.pathManager.AddPublisher(defs.PathAddPublisherReq{
+	path, err := c.pathManager.AddPublisher(defs.PathAddPublisherReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:    pathName,
@@ -405,22 +230,21 @@ func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 			IP:      c.ip(),
 			User:    query.Get("user"),
 			Pass:    query.Get("pass"),
-			Proto:   defs.AuthProtocolRTMP,
+			Proto:   auth.ProtocolRTMP,
 			ID:      &c.uuid,
 		},
 	})
-
-	if res.Err != nil {
-		var terr defs.AuthenticationError
-		if errors.As(res.Err, &terr) {
+	if err != nil {
+		var terr *auth.Error
+		if errors.As(err, &terr) {
 			// wait some seconds to mitigate brute force attacks
-			<-time.After(pauseAfterAuthError)
+			<-time.After(auth.PauseAfterError)
 			return terr
 		}
-		return res.Err
+		return err
 	}
 
-	defer res.Path.RemovePublisher(defs.PathRemovePublisherReq{Author: c})
+	defer path.RemovePublisher(defs.PathRemovePublisherReq{Author: c})
 
 	c.mutex.Lock()
 	c.state = connStatePublish
@@ -432,135 +256,22 @@ func (c *conn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 	if err != nil {
 		return err
 	}
-	videoFormat, audioFormat := r.Tracks()
 
-	var medias []*description.Media
 	var stream *stream.Stream
 
-	if videoFormat != nil {
-		videoMedia := &description.Media{
-			Type:    description.MediaTypeVideo,
-			Formats: []format.Format{videoFormat},
-		}
-		medias = append(medias, videoMedia)
-
-		switch videoFormat.(type) {
-		case *format.AV1:
-			r.OnDataAV1(func(pts time.Duration, tu [][]byte) {
-				stream.WriteUnit(videoMedia, videoFormat, &unit.AV1{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					TU: tu,
-				})
-			})
-
-		case *format.VP9:
-			r.OnDataVP9(func(pts time.Duration, frame []byte) {
-				stream.WriteUnit(videoMedia, videoFormat, &unit.VP9{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					Frame: frame,
-				})
-			})
-
-		case *format.H265:
-			r.OnDataH265(func(pts time.Duration, au [][]byte) {
-				stream.WriteUnit(videoMedia, videoFormat, &unit.H265{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					AU: au,
-				})
-			})
-
-		case *format.H264:
-			r.OnDataH264(func(pts time.Duration, au [][]byte) {
-				stream.WriteUnit(videoMedia, videoFormat, &unit.H264{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					AU: au,
-				})
-			})
-
-		default:
-			return fmt.Errorf("unsupported video codec: %T", videoFormat)
-		}
+	medias, err := rtmp.ToStream(r, &stream)
+	if err != nil {
+		return err
 	}
 
-	if audioFormat != nil { //nolint:dupl
-		audioMedia := &description.Media{
-			Type:    description.MediaTypeAudio,
-			Formats: []format.Format{audioFormat},
-		}
-		medias = append(medias, audioMedia)
-
-		switch audioFormat.(type) {
-		case *format.MPEG4Audio:
-			r.OnDataMPEG4Audio(func(pts time.Duration, au []byte) {
-				stream.WriteUnit(audioMedia, audioFormat, &unit.MPEG4Audio{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					AUs: [][]byte{au},
-				})
-			})
-
-		case *format.MPEG1Audio:
-			r.OnDataMPEG1Audio(func(pts time.Duration, frame []byte) {
-				stream.WriteUnit(audioMedia, audioFormat, &unit.MPEG1Audio{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					Frames: [][]byte{frame},
-				})
-			})
-
-		case *format.G711:
-			r.OnDataG711(func(pts time.Duration, samples []byte) {
-				stream.WriteUnit(audioMedia, audioFormat, &unit.G711{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					Samples: samples,
-				})
-			})
-
-		case *format.LPCM:
-			r.OnDataLPCM(func(pts time.Duration, samples []byte) {
-				stream.WriteUnit(audioMedia, audioFormat, &unit.LPCM{
-					Base: unit.Base{
-						NTP: time.Now(),
-						PTS: pts,
-					},
-					Samples: samples,
-				})
-			})
-
-		default:
-			return fmt.Errorf("unsupported audio codec: %T", audioFormat)
-		}
-	}
-
-	rres := res.Path.StartPublisher(defs.PathStartPublisherReq{
+	stream, err = path.StartPublisher(defs.PathStartPublisherReq{
 		Author:             c,
 		Desc:               &description.Session{Medias: medias},
 		GenerateRTPPackets: true,
 	})
-	if rres.Err != nil {
-		return rres.Err
+	if err != nil {
+		return err
 	}
-
-	stream = rres.Stream
 
 	// disable write deadline to allow outgoing acknowledges
 	c.nconn.SetWriteDeadline(time.Time{})
